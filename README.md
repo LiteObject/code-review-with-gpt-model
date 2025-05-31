@@ -16,6 +16,18 @@ This GitHub Action automates code reviews for pull requests using OpenAI's GPT m
    - `OPENAI_API_KEY`: Your OpenAI API key.
    - `GITHUB_TOKEN`: Provided by GitHub Actions by default.
 
+### Setting the OPENAI_API_KEY Secret
+
+To add your OpenAI API key as a secret in your GitHub repository:
+
+1. Go to your repository on GitHub.
+2. Click on `Settings`.
+3. In the sidebar, click on `Secrets and variables` > `Actions`.
+4. Click the `New repository secret` button.
+5. Set the name to `OPENAI_API_KEY` (all uppercase, no spaces).
+6. Paste your OpenAI API key as the value.
+7. Click `Add secret` to save.
+
 3. **Customize the workflow:**
    - Edit `.github/workflows/code-review.yml` to change the model or adjust diff limits as needed.
 
