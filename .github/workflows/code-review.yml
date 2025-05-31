@@ -1,0 +1,149 @@
+name: PR Code Review with OpenAI GPT
+
+# Trigger the workflow when a pull request is opened or updated
+on:
+  pull_request_target:
+    branches:
+      - main
+
+jobs:
+  code-review:
+    name: Review Changes with OpenAI GPT
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write  # Allows the workflow to write comments on issues and pull requests
+      pull-requests: write  # Allows the workflow to write comments on pull requests
+    env:
+      MODEL_NAME: "gpt-4o-mini"  # or "gpt-4", "gpt-3.5-turbo"
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetches all history for the entire branch
+
+      - name: Fetch all branches
+        run: git fetch --all
+
+      - name: Generate Diff
+        id: generate-diff
+        run: |
+          echo "Generating diff between origin/${{ github.base_ref }} and origin/${{ github.head_ref }}"
+          git diff --unified=10 origin/${{ github.base_ref }}...origin/${{ github.head_ref }} > changes.diff
+          # Check if diff is empty
+          if [ ! -s changes.diff ]; then
+            echo "No changes detected"
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+            exit 0
+          fi
+          # Limit diff size to avoid token limits (first 200 lines for GPT)
+          head -200 changes.diff > limited_changes.diff
+          mv limited_changes.diff changes.diff
+
+      - name: Sanitize Diff
+        run: |
+          # Remove metadata lines and retain only actual code changes (+/-)
+          grep -E '^(diff --git|index |--- |\+\+\+ |@@ |\+|-)' changes.diff | \
+            sed 's/^+/Added: /; s/^-/Removed: /' > sanitized_diff.txt
+          echo "Sanitized diff content:"
+          cat sanitized_diff.txt
+
+      - name: Upload Diff as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitized-pr-diff
+          path: sanitized_diff.txt
+
+      - name: Prepare Prompt
+        run: |
+          DIFF=$(cat sanitized_diff.txt)
+          # Check if diff is empty
+          if [ -z "$DIFF" ]; then
+            echo "No changes detected in the diff"
+            DIFF="No code changes detected in this pull request."
+          fi
+          
+          PROMPT="You are an experienced software engineer reviewing a pull request. Carefully review the following code changes for correctness, clarity, maintainability, and potential issues. Summarize what was changed, point out any problems or improvements, and provide constructive, actionable feedback as a code reviewer would in a real PR review.
+
+          Code Changes:
+          $DIFF
+
+          Please provide your review in a clear, organized format with specific feedback and suggestions."
+
+          echo "PROMPT:"
+          echo "$PROMPT"
+          
+          # Export PROMPT so it's available to later steps
+          echo "PROMPT<<EOF" >> $GITHUB_ENV
+          echo "$PROMPT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        shell: /usr/bin/bash -e {0}
+
+      - name: Code Review with OpenAI
+        run: |
+          echo "Starting code review with OpenAI model: $MODEL_NAME"
+          
+          # Prepare JSON payload for OpenAI API
+          PAYLOAD=$(jq -n \
+            --arg model "$MODEL_NAME" \
+            --arg prompt "$PROMPT" \
+            '{
+              model: $model,
+              messages: [
+                {
+                  role: "user",
+                  content: $prompt
+                }
+              ],
+              temperature: 0.3,
+              max_tokens: 2000
+            }')
+          
+          echo "Sending request to OpenAI API..."
+          RAW_RESPONSE=$(curl -s -X POST https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -d "$PAYLOAD" || { echo "OpenAI API call failed"; exit 1; })
+          
+          echo "RAW RESPONSE received"
+          
+          # Extract the review content from OpenAI response
+          REVIEW=$(echo "$RAW_RESPONSE" | jq -r '.choices[0].message.content // empty')
+          
+          # Check for API errors
+          ERROR_MESSAGE=$(echo "$RAW_RESPONSE" | jq -r '.error.message // empty')
+          if [ ! -z "$ERROR_MESSAGE" ] && [ "$ERROR_MESSAGE" != "null" ]; then
+            echo "OpenAI API Error: $ERROR_MESSAGE"
+            REVIEW="❌ OpenAI API Error: $ERROR_MESSAGE"
+          elif [ -z "$REVIEW" ] || [ "$REVIEW" = "null" ]; then
+            echo "Error: No valid response from OpenAI API"
+            REVIEW="❌ No valid review generated. Please check the OpenAI API configuration."
+          fi
+          
+          echo "Final review content:"
+          echo "$REVIEW"
+          
+          # Export REVIEW for the next step
+          echo "REVIEW<<EOF" >> $GITHUB_ENV
+          echo "$REVIEW" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Post Review Comment
+        if: env.NO_CHANGES != 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const review = process.env.REVIEW || 'No review generated due to an error.';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### 🤖 OpenAI GPT Code Review\n\n${review}\n\n---\n*Powered by ${process.env.MODEL_NAME}*`
+            });
+
+      - name: Add Job Summary
+        run: |
+          echo "### OpenAI GPT Code Review Completed" >> $GITHUB_STEP_SUMMARY
+          echo "Model: $MODEL_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "Status: $([ "$NO_CHANGES" = "true" ] && echo "No changes detected" || echo "Review completed")" >> $GITHUB_STEP_SUMMARY
+        shell: /usr/bin/bash -e {0}
